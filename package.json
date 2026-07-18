@@ -1,0 +1,37 @@
+{
+  "name": "lingshu",
+  "version": "0.2.0",
+  "private": true,
+  "description": "灵枢 — 本地桌面 AI 助手（monorepo: electron + backend + Python sidecar + shared-types）",
+  "workspaces": [
+    "packages/*",
+    "electron",
+    "backend"
+  ],
+  "scripts": {
+    "dev:backend": "npm --workspace backend run dev",
+    "dev:electron": "npm --workspace electron run dev",
+    "dev:python": "cd soul && uv run python -m soul.api",
+    "dev": "concurrently -k -n backend,python,electron -c blue,magenta,green \"npm:dev:backend\" \"npm:dev:python\" \"npm:dev:electron\"",
+    "test:backend": "npm --workspace backend test",
+    "test:python": "cd soul && uv run pytest",
+    "test:e2e:full": "playwright test scripts/e2e-full-stack.test.ts",
+    "test:count": "tsx scripts/check-tests-count.ts",
+    "test": "npm run test:backend && npm run test:python",
+    "typecheck:backend": "npm --workspace backend exec -- tsc --noEmit",
+    "typecheck": "npm run typecheck:backend",
+    "lint:python": "cd soul && uv run ruff check .",
+    "lint": "npm run lint:python",
+    "verify": "npm run typecheck && npm run lint && npm test",
+    "build:electron": "npm --workspace electron run package:win"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.1",
+    "@types/jszip": "^3.4.0",
+    "concurrently": "^9.1.0",
+    "playwright": "^1.61.1"
+  },
+  "dependencies": {
+    "jszip": "^3.10.1"
+  }
+}

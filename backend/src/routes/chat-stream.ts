@@ -1,0 +1,311 @@
+/**
+ * Chat Stream SSE Route — 灵枢统一聊天通道
+ *
+ * POST /chat/stream
+ *   body: { message: string, model?: ModelProvider, conversationId?: string }
+ *   returns: text/event-stream
+ *     - message_start     → 流开始, 含 messageId
+ *     - text_delta        → token-by-token 文本片段
+ *     - tool_call         → 转发的 ToolCallEvent (from envelopes/tool-call)
+ *     - awareness         → awareness.update / snapshot 透传
+ *     - message_finish    → 流结束, 包含 finishReason
+ *     - error             → 错误, 流结束
+ *   心跳:  ": ping\n\n" 每 15s
+ *   鉴权: Authorization: Bearer <token>  (无 token 也允许, 跟 WS /api/health 一致 — V6 单机本地)
+ *
+ * 设计原则:
+ *   - 不破坏现有 ws /chat 主通道 (chat-handler 仍然走 ws)
+ *   - 复用 models/registry.streamChat 走 4 个 provider
+ *   - 订阅 tools/envelopes/tool-call 把它转成 SSE event
+ *   - 复用 main-loop 的 awareness 通道,把 awareness.update envelope 透传
+ *   - AbortController: client close → abort LLM stream
+ */
+
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import { z } from 'zod';
+import {
+  streamChat,
+  listAvailableProviders,
+  type ModelProvider,
+} from '../models/registry.js';
+import {
+  subscribeToolCallEvents,
+  type ToolCallEvent,
+} from '../envelopes/tool-call.js';
+import { newId } from '../util/id.js';
+import { sessionRegistry } from '../session/registry.js';
+import type { MainLoop } from '../agent/main-loop.js';
+
+// ── Request schema ─────────────────────────────────────────────
+const ChatStreamBodySchema = z.object({
+  message: z.string().min(1).max(100_000),
+  model: z
+    .enum(['deepseek', 'openai', 'anthropic', 'ollama'])
+    .optional(),
+  conversationId: z.string().min(1).optional(),
+  systemPrompt: z.string().optional(),
+  temperature: z.number().min(0).max(2).optional(),
+  maxTokens: z.number().int().positive().max(32_000).optional(),
+});
+type ChatStreamBody = z.infer<typeof ChatStreamBodySchema>;
+
+// ── SSE wire format ────────────────────────────────────────────
+type SseEvent =
+  | { type: 'message_start'; messageId: string; model: ModelProvider; timestamp: number }
+  | { type: 'text_delta'; messageId: string; delta: string }
+  | { type: 'tool_call'; messageId: string; event: ToolCallEvent }
+  | { type: 'awareness'; messageId: string; envelope: unknown }
+  | {
+      type: 'usage';
+      messageId: string;
+      promptTokens: number;
+      completionTokens: number;
+      totalTokens: number;
+      provider: ModelProvider;
+      model: string;
+    }
+  | { type: 'message_finish'; messageId: string; finishReason: string | null; timestamp: number }
+  | { type: 'error'; messageId: string; code: string; message: string; recoverable: boolean };
+
+function sseEncode(event: SseEvent): string {
+  return `data: ${JSON.stringify(event)}\n\n`;
+}
+
+// 心跳: SSE 注释行
+function ssePing(): string {
+  return `: ping\n\n`;
+}
+
+// ── 心跳 / timeout 常量 ─────────────────────────────────────────
+const HEARTBEAT_MS = 15_000;
+const STREAM_TIMEOUT_MS = 600_000; // 10 分钟, 跟 chat-handler watchdog 默认值一致
+
+// ── Route factory ──────────────────────────────────────────────
+export interface ChatStreamRouteDeps {
+  /** MainLoop — 用于拉 awareness snapshot 推到前端 */
+  mainLoop?: MainLoop;
+  /** 默认 model (无 body.model 时用) */
+  defaultProvider?: ModelProvider;
+}
+
+export function createChatStreamRoute(deps: ChatStreamRouteDeps = {}) {
+  const defaultProvider: ModelProvider =
+    deps.defaultProvider ??
+    (listAvailableProviders().includes('deepseek') ? 'deepseek' : 'ollama');
+
+  return async function chatStreamHandler(
+    req: FastifyRequest<{ Body: unknown }>,
+    reply: FastifyReply,
+  ): Promise<void> {
+    // ── 1. parse body ─────────────────────────────────────────
+    const parsed = ChatStreamBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      reply.code(400);
+      reply.send({ ok: false, error: parsed.error.message });
+      return;
+    }
+    const body: ChatStreamBody = parsed.data;
+    const provider = body.model ?? defaultProvider;
+    const messageId = newId('msg');
+
+    // ── 2. SSE headers ───────────────────────────────────────
+    // raw socket hijack: 用 reply.hijack() 拿到原生 res, 自己写 SSE 帧。
+    void reply.code(200);
+    void reply.header('Content-Type', 'text/event-stream; charset=utf-8');
+    void reply.header('Cache-Control', 'no-cache, no-transform');
+    void reply.header('Connection', 'keep-alive');
+    void reply.header('X-Accel-Buffering', 'no');
+    void reply.send(); // 显式 begin response — fastify 才能切到 raw
+
+    const raw = reply.raw;
+    // 让 Node 知道这是一个 streaming response
+    if ('flushHeaders' in raw && typeof raw.flushHeaders === 'function') {
+      try {
+        (raw as { flushHeaders: () => void }).flushHeaders();
+      } catch {
+        // ignore — some sandbox envs (test) 不支持
+      }
+    }
+
+    const write = (data: string): void => {
+      if (closed) return;
+      // 检查 raw 是否真的不可写 (测试环境的 mock 可能 writable undefined)
+      try {
+        if (raw.writableEnded === true || raw.destroyed === true) {
+          closed = true;
+          return;
+        }
+      } catch {
+        // raw 上无该属性 (mock 情况) — 假定可写
+      }
+      try {
+        raw.write(data);
+      } catch {
+        // client closed: 吞掉, 由 on('close') 终止循环
+        closed = true;
+      }
+    };
+
+    // ── 3. abort + heartbeat wiring ─────────────────────────
+    const abortCtl = new AbortController();
+    let closed = false;
+    const onClose = (): void => {
+      if (closed) return;
+      closed = true;
+      if (!abortCtl.signal.aborted) abortCtl.abort();
+      clearInterval(heartbeat);
+      clearTimeout(streamTimeout);
+      unsubscribeToolCall();
+    };
+    raw.on('close', onClose);
+
+    const heartbeat = setInterval(() => {
+      if (closed) return;
+      write(ssePing());
+    }, HEARTBEAT_MS);
+    if (typeof heartbeat.unref === 'function') heartbeat.unref();
+
+    const streamTimeout = setTimeout(() => {
+      if (closed) return;
+      abortCtl.abort();
+    }, STREAM_TIMEOUT_MS);
+    if (typeof streamTimeout.unref === 'function') streamTimeout.unref();
+
+    // ── 4. wire tool_call envelope → SSE forward ─────────────
+    const unsubscribeToolCall = subscribeToolCallEvents((event) => {
+      if (closed) return;
+      try {
+        write(sseEncode({ type: 'tool_call', messageId, event }));
+      } catch {
+        // ignore write errors — client 已断
+      }
+    });
+
+    // ── 5. emit message_start ───────────────────────────────
+    write(sseEncode({
+      type: 'message_start',
+      messageId,
+      model: provider,
+      timestamp: Date.now(),
+    }));
+
+    // ── 5b. bind session (V6 主屏数据源) ─────────────────────
+    sessionRegistry.bindCurrent(
+      body.conversationId,
+      provider,
+      body.model ?? provider
+    );
+
+    // ── 6. main: stream provider → text_delta ───────────────
+    let finishReason: string | null = null;
+    let sawError = false;
+    let lastUsage: { promptTokens: number; completionTokens: number } | undefined;
+    try {
+      const messages = [
+        ...(body.systemPrompt
+          ? [{ role: 'system' as const, content: body.systemPrompt }]
+          : []),
+        { role: 'user' as const, content: body.message },
+      ];
+
+      for await (const chunk of streamChat(provider, {
+        messages,
+        temperature: body.temperature,
+        max_tokens: body.maxTokens,
+        signal: abortCtl.signal,
+      })) {
+        if (closed) break;
+        if (chunk.delta) {
+          write(sseEncode({
+            type: 'text_delta',
+            messageId,
+            delta: chunk.delta,
+          }));
+        }
+        if (chunk.usage) {
+          lastUsage = chunk.usage;
+        }
+        if (chunk.finishReason) {
+          finishReason = chunk.finishReason;
+        }
+        if (chunk.done) break;
+      }
+    } catch (err) {
+      sawError = true;
+      if (!closed) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        // 不暴露 internal stack — 给前端友好提示
+        const friendly = friendlyStreamError(errMsg);
+        write(sseEncode({
+          type: 'error',
+          messageId,
+          code: 'stream_error',
+          message: friendly,
+          recoverable: !/auth|401|403/i.test(errMsg),
+        }));
+      }
+    } finally {
+      // ── 7. emit usage event + 累加到 session registry (V6 数据源) ──
+      if (!closed && lastUsage) {
+        const prompt = lastUsage.promptTokens;
+        const completion = lastUsage.completionTokens;
+        sessionRegistry.recordUsage({
+          provider,
+          model: body.model ?? provider,
+          promptTokens: prompt,
+          completionTokens: completion,
+        });
+        write(sseEncode({
+          type: 'usage',
+          messageId,
+          promptTokens: prompt,
+          completionTokens: completion,
+          totalTokens: prompt + completion,
+          provider,
+          model: body.model ?? provider,
+        }));
+      }
+      // ── 8. emit message_finish (always) ─────────────────────
+      if (!closed) {
+        if (!sawError) {
+          write(sseEncode({
+            type: 'message_finish',
+            messageId,
+            finishReason,
+            timestamp: Date.now(),
+          }));
+        }
+      }
+      // ── 9. cleanup ─────────────────────────────────────────
+      raw.off('close', onClose);
+      unsubscribeToolCall();
+      clearInterval(heartbeat);
+      clearTimeout(streamTimeout);
+      if (!closed) {
+        try { raw.end(); } catch { /* ignore */ }
+      }
+    }
+  };
+}
+
+// ── 错误友好化 (借鉴 chat-handler 的 toFriendlyMessage) ──────────
+function friendlyStreamError(msg: string): string {
+  if (/auth|401|403|invalid.*key|api.*key/i.test(msg)) return '访问密钥无效，请到设置里检查';
+  if (/rate.*limit|429|too.*many/i.test(msg)) return '请求太频繁，请稍后再试';
+  if (/network|fetch.*failed|ECONNREFUSED|ENOTFOUND/i.test(msg)) return '连不上 AI 服务，请检查网络';
+  if (/timeout|aborted/i.test(msg)) return 'AI 响应超时，请重试';
+  return 'AI 服务暂不可用，请稍后再试';
+}
+
+// ── 单独暴露: GET /chat/stream/providers — 列出可用 provider ──────
+export function createChatStreamMetaRoute() {
+  return async function getProvidersHandler(): Promise<{
+    providers: ModelProvider[];
+    default: ModelProvider;
+  }> {
+    return {
+      providers: listAvailableProviders(),
+      default: listAvailableProviders().includes('deepseek') ? 'deepseek' : 'ollama',
+    };
+  };
+}

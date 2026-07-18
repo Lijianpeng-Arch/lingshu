@@ -1,0 +1,73 @@
+/**
+ * MVP globals — 极简暗色主题 (2026-07-18 MVP 重启)
+ *
+ * 设计原则:
+ * - 单一背景色 (#0e0e10)
+ * - 单一强调色 (蓝 #2563eb)
+ * - 不用 Tailwind (V6 撤销教训)
+ * - 不用 emoji 当 UI 元素
+ * - 中文优先字体
+ */
+
+:root {
+  --bg: #0e0e10;
+  --bg-elevated: #18181b;
+  --bg-input: #1f2937;
+  --border: #2d2d35;
+  --text: #e5e7eb;
+  --text-muted: #9ca3af;
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --user-bubble: #2563eb;
+  --assistant-bubble: #1f2937;
+  --error: #ef4444;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  font-family: 'PingFang SC', 'Microsoft YaHei', '微软雅黑', system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+}
+
+input,
+textarea,
+select {
+  font-family: inherit;
+  font-size: inherit;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #2d2d35;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3d3d45;
+}

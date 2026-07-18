@@ -1,0 +1,52 @@
+{
+  "name": "@lingshu/electron",
+  "version": "0.1.0",
+  "private": true,
+  "main": "out/main/main.js",
+  "scripts": {
+    "dev": "node scripts/run-electron-vite.js dev",
+    "build": "node scripts/run-electron-vite.js build",
+    "preview": "node scripts/run-electron-vite.js preview",
+    "start": "node scripts/run-electron-vite.js preview",
+    "package": "electron-vite build && electron-builder",
+    "package:win": "electron-vite build && electron-builder --win",
+    "package:mac": "electron-vite build && electron-builder --mac",
+    "package:linux": "electron-vite build && electron-builder --linux",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.5.0",
+    "@testing-library/react": "^16.0.0",
+    "@types/jszip": "^3.4.0",
+    "@types/node": "^22.9.0",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^4.3.0",
+    "autoprefixer": "^10.4.0",
+    "electron": "^33.4.11",
+    "electron-builder": "^25.0.0",
+    "electron-vite": "^2.3.0",
+    "jsdom": "^25.0.0",
+    "jszip": "^3.10.1",
+    "postcss": "^8.4.0",
+    "tailwindcss": "^3.4.0",
+    "typescript": "^5.7.2",
+    "vite": "^5.4.0",
+    "vitest": "^2.1.5"
+  },
+  "dependencies": {
+    "@phosphor-icons/react": "^2.1.10",
+    "@radix-ui/react-dialog": "^1.1.19",
+    "@radix-ui/react-dropdown-menu": "^2.1.20",
+    "@radix-ui/react-slot": "^1.3.0",
+    "@radix-ui/react-toast": "^1.2.19",
+    "@radix-ui/react-tooltip": "^1.2.12",
+    "@types/d3": "^7.4.3",
+    "d3": "^7.9.0",
+    "framer-motion": "^11.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "shiki": "^4.3.1",
+    "zustand": "^5.0.0"
+  }
+}

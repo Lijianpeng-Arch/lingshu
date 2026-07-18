@@ -1,0 +1,30 @@
+appId: ai.lingshu.desktop
+productName: 灵枢
+directories:
+  output: ../../dist/installer
+  buildResources: build
+files:
+  - "dist/**/*"
+  - "package.json"
+asar: true
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: 灵枢
+mac:
+  target:
+    - target: dmg
+      arch: [x64, arm64]
+  category: public.app-category.productivity
+linux:
+  target:
+    - target: AppImage
+      arch: [x64]
+  category: Office

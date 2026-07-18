@@ -1,0 +1,617 @@
+{
+  "version": "2.0.0",
+  "generated": "2026-07-16T07:43:47.796Z",
+  "source": "backend/src/tools/builtin.ts",
+  "description": "灵枢 V2 全部内置工具元数据。自动从 builtin.ts 提取 + schema 校验。",
+  "schemaRef": "./metadata.schema.json",
+  "tools": [
+    {
+      "name": "list_files",
+      "displayName": "列文件",
+      "displayDescription": "列出目录下的文件和文件夹",
+      "description": "List files in a directory (sandboxed to project root).",
+      "category": "filesystem",
+      "risk": "low",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": []
+      },
+      "examples": [
+        {
+          "description": "列出项目根目录",
+          "args": {
+            "path": "."
+          },
+          "expected": "返回 entries: [{name, type}]"
+        }
+      ],
+      "borrowedFrom": "self",
+      "sourceFile": "backend/src/tools/builtin.ts"
+    },
+    {
+      "name": "read_file",
+      "displayName": "读文件",
+      "displayDescription": "读文本文件,支持 offset+limit,最大 5MB",
+      "description": "Read a text file (sandboxed, offset+limit supported, default 100KB per call, max 5MB).",
+      "category": "filesystem",
+      "risk": "low",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "offset": {
+            "type": "number"
+          },
+          "limit": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "examples": [
+        {
+          "description": "读 README.md 全文",
+          "args": {
+            "path": "~/project/README.md"
+          },
+          "expected": "返回 content 字符串"
+        },
+        {
+          "description": "分段读 5MB 大文件",
+          "args": {
+            "path": "~/data/big.log",
+            "offset": 0,
+            "limit": 1000
+          },
+          "expected": "返回 content (前 1000 字节)"
+        }
+      ],
+      "borrowedFrom": "self",
+      "sourceFile": "backend/src/tools/builtin.ts"
+    },
+    {
+      "name": "run_command",
+      "displayName": "执行命令",
+      "displayDescription": "在沙箱里执行 shell 命令(危险命令被拦截)",
+      "description": "Run a shell command (sandboxed, dangerous commands blocked).",
+      "category": "filesystem",
+      "risk": "high",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "timeoutMs": {
+            "type": "number",
+            "description": "Timeout in ms (default 60000, use >= 300000 for long-running tasks)"
+          }
+        },
+        "required": [
+          "command"
+        ]
+      },
+      "examples": [
+        {
+          "description": "运行 npm test",
+          "args": {
+            "command": "npm test"
+          },
+          "expected": "返回 { ok: true, stdout, stderr }"
+        },
+        {
+          "description": "危险命令被拦截",
+          "args": {
+            "command": "rm -rf /"
+          },
+          "expected": "返回 { ok: false, error: \"Command blocked by safety filter\" }"
+        }
+      ],
+      "borrowedFrom": "self",
+      "sourceFile": "backend/src/tools/builtin.ts"
+    },
+    {
+      "name": "web_search",
+      "displayName": "联网搜索",
+      "displayDescription": "搜索网络内容(Phase 1 stub)",
+      "description": "Search the web (Phase 1 stub).",
+      "category": "search",
+      "risk": "low",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "examples": [
+        {
+          "description": "搜索 TypeScript 教程",
+          "args": {
+            "query": "TypeScript tutorial 2026"
+          },
+          "expected": "返回 { ok: true, results: [{ title, url, snippet }] } (Phase 1 stub)"
+        }
+      ],
+      "borrowedFrom": "self",
+      "sourceFile": "backend/src/tools/builtin.ts"
+    },
+    {
+      "name": "write_file",
+      "displayName": "写入文件",
+      "displayDescription": "将内容写入文件 (覆盖), 自动创建父目录",
+      "description": "Write content to a file (overwrites), creates parent dirs as needed. Borrowed from OpenCode tool/write.ts.",
+      "category": "filesystem",
+      "risk": "medium",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "文件绝对路径"
+          },
+          "content": {
+            "type": "string",
+            "description": "要写入的内容"
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ]
+      },
+      "examples": [
+        {
+          "description": "创建 README.md",
+          "args": {
+            "path": "~/project/README.md",
+            "content": "# My Project\n"
+          },
+          "expected": "返回 { ok: true, output: \"Wrote 14 bytes to ~/project/README.md\" }"
+        }
+      ],
+      "borrowedFrom": "OpenCode tool/write",
+      "sourceFile": "backend/src/tools/builtin/filesystem/write_file.ts"
+    },
+    {
+      "name": "edit_file",
+      "displayName": "编辑文件",
+      "displayDescription": "精确匹配替换一段文本 (防误改: 唯一匹配才成功)",
+      "description": "Exact-match string replace; refuses to operate when oldText appears 0 or >1 times. Borrowed from OpenCode tool/edit.ts.",
+      "category": "filesystem",
+      "risk": "medium",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "文件绝对路径"
+          },
+          "oldText": {
+            "type": "string",
+            "description": "要替换的原文本"
+          },
+          "newText": {
+            "type": "string",
+            "description": "新文本"
+          }
+        },
+        "required": [
+          "path",
+          "oldText",
+          "newText"
+        ]
+      },
+      "examples": [
+        {
+          "description": "替换 README 标题",
+          "args": {
+            "path": "~/project/README.md",
+            "oldText": "# My Project",
+            "newText": "# Better Project"
+          },
+          "expected": "返回 { ok: true, output: \"Edited ~/project/README.md\" }"
+        }
+      ],
+      "borrowedFrom": "OpenCode tool/edit",
+      "sourceFile": "backend/src/tools/builtin/filesystem/edit_file.ts"
+    },
+    {
+      "name": "delete_file",
+      "displayName": "删除文件",
+      "displayDescription": "删除单个文件 (不删目录)",
+      "description": "Delete a single file; refuses directories (use rm tool). Borrowed from OpenCode tool/bash.ts.",
+      "category": "filesystem",
+      "risk": "high",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "文件绝对路径"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "examples": [
+        {
+          "description": "删除临时文件",
+          "args": {
+            "path": "~/project/tmp/scratch.txt"
+          },
+          "expected": "返回 { ok: true, output: \"Deleted ~/project/tmp/scratch.txt\" }"
+        }
+      ],
+      "borrowedFrom": "OpenCode tool/bash",
+      "sourceFile": "backend/src/tools/builtin/filesystem/delete_file.ts"
+    },
+    {
+      "name": "mkdir",
+      "displayName": "创建目录",
+      "displayDescription": "创建目录 (默认递归, 自动创建父目录)",
+      "description": "Create a directory (mkdir -p semantics by default). Borrowed from OpenCode tool/bash.ts.",
+      "category": "filesystem",
+      "risk": "medium",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "目录绝对路径"
+          },
+          "recursive": {
+            "type": "boolean",
+            "default": true,
+            "description": "递归创建父目录"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "examples": [
+        {
+          "description": "递归创建多级目录",
+          "args": {
+            "path": "~/project/a/b/c"
+          },
+          "expected": "返回 { ok: true, output: \"Created ~/project/a/b/c\" }"
+        }
+      ],
+      "borrowedFrom": "OpenCode tool/bash",
+      "sourceFile": "backend/src/tools/builtin/filesystem/mkdir.ts"
+    },
+    {
+      "name": "mv",
+      "displayName": "移动/重命名",
+      "displayDescription": "移动文件或重命名",
+      "description": "Move or rename a file/directory. Borrowed from OpenCode tool/bash.ts.",
+      "category": "search",
+      "risk": "medium",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "src": {
+            "type": "string",
+            "description": "源路径"
+          },
+          "dst": {
+            "type": "string",
+            "description": "目标路径"
+          }
+        },
+        "required": [
+          "src",
+          "dst"
+        ]
+      },
+      "examples": [
+        {
+          "description": "重命名文件",
+          "args": {
+            "src": "~/project/old.ts",
+            "dst": "~/project/new.ts"
+          },
+          "expected": "返回 { ok: true, output: \"Moved ~/project/old.ts → ~/project/new.ts\" }"
+        }
+      ],
+      "borrowedFrom": "OpenCode tool/bash",
+      "sourceFile": "backend/src/tools/builtin/search/mv.ts"
+    },
+    {
+      "name": "cp",
+      "displayName": "复制",
+      "displayDescription": "复制文件或目录",
+      "description": "Copy a file or directory. Borrowed from OpenCode tool/bash.ts.",
+      "category": "search",
+      "risk": "medium",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "src": {
+            "type": "string",
+            "description": "源路径"
+          },
+          "dst": {
+            "type": "string",
+            "description": "目标路径"
+          },
+          "recursive": {
+            "type": "boolean",
+            "default": false,
+            "description": "递归复制目录"
+          }
+        },
+        "required": [
+          "src",
+          "dst"
+        ]
+      },
+      "examples": [
+        {
+          "description": "复制目录",
+          "args": {
+            "src": "~/project/src",
+            "dst": "~/project/src-backup",
+            "recursive": true
+          },
+          "expected": "返回 { ok: true, output: \"Copied ~/project/src → ~/project/src-backup\" }"
+        }
+      ],
+      "borrowedFrom": "OpenCode tool/bash",
+      "sourceFile": "backend/src/tools/builtin/search/cp.ts"
+    },
+    {
+      "name": "rm",
+      "displayName": "删除目录",
+      "displayDescription": "递归删除目录 (含子目录和文件)",
+      "description": "Recursively remove a directory (or force-delete a file). Borrowed from OpenCode tool/bash.ts.",
+      "category": "search",
+      "risk": "high",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "路径"
+          },
+          "force": {
+            "type": "boolean",
+            "default": false,
+            "description": "强制 (忽略不存在)"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "examples": [
+        {
+          "description": "递归删除目录",
+          "args": {
+            "path": "~/project/node_modules"
+          },
+          "expected": "返回 { ok: true, output: \"Removed ~/project/node_modules\" }"
+        }
+      ],
+      "borrowedFrom": "OpenCode tool/bash",
+      "sourceFile": "backend/src/tools/builtin/search/rm.ts"
+    },
+    {
+      "name": "glob",
+      "displayName": "按名找文件",
+      "displayDescription": "用 glob 模式找文件 (如 \"**/*.ts\")",
+      "description": "Find files matching a glob pattern. Borrowed from OpenCode tool/glob.ts.",
+      "category": "search",
+      "risk": "low",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "glob 模式 (如 **/*.ts)"
+          },
+          "cwd": {
+            "type": "string",
+            "description": "搜索根目录 (默认 process.cwd())"
+          },
+          "ignore": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [
+              "node_modules",
+              ".git"
+            ],
+            "description": "要忽略的目录/模式"
+          }
+        },
+        "required": [
+          "pattern"
+        ]
+      },
+      "examples": [
+        {
+          "description": "找所有 ts 文件",
+          "args": {
+            "pattern": "**/*.ts"
+          },
+          "expected": "返回 { ok: true, output: \"<file1>\n<file2>\", count: N }"
+        }
+      ],
+      "borrowedFrom": "OpenCode tool/glob",
+      "sourceFile": "backend/src/tools/builtin/search/glob.ts"
+    },
+    {
+      "name": "grep",
+      "displayName": "搜文本",
+      "displayDescription": "在文件中搜索文本 (ripgrep 包装)",
+      "description": "Search file contents with ripgrep. Borrowed from OpenCode tool/grep.ts.",
+      "category": "search",
+      "risk": "low",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "正则或字面量模式"
+          },
+          "path": {
+            "type": "string",
+            "default": ".",
+            "description": "搜索根路径"
+          },
+          "include": {
+            "type": "string",
+            "description": "文件 glob 过滤 (如 *.ts)"
+          }
+        },
+        "required": [
+          "pattern"
+        ]
+      },
+      "examples": [
+        {
+          "description": "在 src 里搜 TODO",
+          "args": {
+            "pattern": "TODO",
+            "path": "src",
+            "include": "*.ts"
+          },
+          "expected": "返回 { ok: true, output: \"<file>:<line>:<text>\" }"
+        }
+      ],
+      "borrowedFrom": "OpenCode tool/grep",
+      "sourceFile": "backend/src/tools/builtin/search/grep.ts"
+    },
+    {
+      "name": "git_status",
+      "displayName": "git 状态",
+      "displayDescription": "显示 git working tree 状态",
+      "description": "Show short git status. Borrowed from OpenCode tool/bash.ts.",
+      "category": "git",
+      "risk": "low",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "cwd": {
+            "type": "string",
+            "description": "仓库路径 (默认 process.cwd())"
+          }
+        }
+      },
+      "examples": [
+        {
+          "description": "查看当前仓库状态",
+          "args": {},
+          "expected": "返回 { ok: true, output: \"M src/index.ts\n? new.ts\" 或 \"(clean)\" }"
+        }
+      ],
+      "borrowedFrom": "OpenCode tool/bash",
+      "sourceFile": "backend/src/tools/builtin/git/git_status.ts"
+    },
+    {
+      "name": "git_diff",
+      "displayName": "git diff",
+      "displayDescription": "显示未提交改动",
+      "description": "Show git diff (unstaged by default). Borrowed from OpenCode tool/bash.ts.",
+      "category": "git",
+      "risk": "low",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "cwd": {
+            "type": "string",
+            "description": "仓库路径"
+          },
+          "staged": {
+            "type": "boolean",
+            "default": false,
+            "description": "查看已 staged 的改动"
+          }
+        }
+      },
+      "examples": [
+        {
+          "description": "查看未提交改动",
+          "args": {},
+          "expected": "返回 { ok: true, output: \"diff --git a/...\" }"
+        },
+        {
+          "description": "查看已 staged 改动",
+          "args": {
+            "staged": true
+          },
+          "expected": "返回 staged diff"
+        }
+      ],
+      "borrowedFrom": "OpenCode tool/bash",
+      "sourceFile": "backend/src/tools/builtin/git/git_status.ts"
+    },
+    {
+      "name": "git_commit",
+      "displayName": "git 提交",
+      "displayDescription": "git add + commit (绝不 push)",
+      "description": "git add + commit; hardcoded rejects any message containing \"push\". Borrowed from OpenCode tool/bash.ts.",
+      "category": "git",
+      "risk": "high",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string",
+            "description": "commit message (不含 push)"
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "要 add 的文件 (默认全部: [\".\"])"
+          },
+          "cwd": {
+            "type": "string",
+            "description": "仓库路径"
+          }
+        },
+        "required": [
+          "message"
+        ]
+      },
+      "examples": [
+        {
+          "description": "提交所有未暂存改动",
+          "args": {
+            "message": "feat: add new feature"
+          },
+          "expected": "返回 { ok: true, output: \"[main abc123] feat: add new feature\" }"
+        },
+        {
+          "description": "禁止 push",
+          "args": {
+            "message": "push latest changes"
+          },
+          "expected": "返回 { ok: false, error: \"git_commit tool forbids push\" }"
+        }
+      ],
+      "borrowedFrom": "OpenCode tool/bash",
+      "sourceFile": "backend/src/tools/builtin/git/git_status.ts"
+    }
+  ]
+}
