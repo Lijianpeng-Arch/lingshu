@@ -35,6 +35,11 @@ import {
 import { newId } from '../util/id.js';
 import { sessionRegistry } from '../session/registry.js';
 import type { MainLoop } from '../agent/main-loop.js';
+import type { ChatMessage } from '../providers/types.js';
+import type { ToolRegistry, ToolDefinition } from '../tools/registry.js';
+import { createToolRegistry } from '../tools/registry.js';
+import { BUILTIN_TOOLS } from '../tools/builtin.js';
+import { emitToolCall, type ToolCallResultEvent, type ToolCallStartEvent } from '../envelopes/tool-call.js';
 
 // ── Request schema ─────────────────────────────────────────────
 const ChatStreamBodySchema = z.object({
@@ -86,12 +91,20 @@ export interface ChatStreamRouteDeps {
   mainLoop?: MainLoop;
   /** 默认 model (无 body.model 时用) */
   defaultProvider?: ModelProvider;
+  /** Tool registry used by the real LLM tool loop. */
+  toolRegistry?: ToolRegistry;
 }
 
 export function createChatStreamRoute(deps: ChatStreamRouteDeps = {}) {
   const defaultProvider: ModelProvider =
     deps.defaultProvider ??
     (listAvailableProviders().includes('deepseek') ? 'deepseek' : 'ollama');
+  const toolRegistry = deps.toolRegistry ?? (() => {
+    const registry = createToolRegistry();
+    registry.registerMany(BUILTIN_TOOLS);
+    return registry;
+  })();
+  const MAX_TOOL_TURNS = 8;
 
   return async function chatStreamHandler(
     req: FastifyRequest<{ Body: unknown }>,
@@ -156,6 +169,7 @@ export function createChatStreamRoute(deps: ChatStreamRouteDeps = {}) {
       clearInterval(heartbeat);
       clearTimeout(streamTimeout);
       unsubscribeToolCall();
+      unsubscribeAwareness();
     };
     raw.on('close', onClose);
 
@@ -180,6 +194,11 @@ export function createChatStreamRoute(deps: ChatStreamRouteDeps = {}) {
         // ignore write errors — client 已断
       }
     });
+    const unsubscribeAwareness = deps.mainLoop
+      ? deps.mainLoop.subscribeAwareness((envelope) => {
+          if (!closed) write(sseEncode({ type: 'awareness', messageId, envelope }));
+        })
+      : () => undefined;
 
     // ── 5. emit message_start ───────────────────────────────
     write(sseEncode({
@@ -201,34 +220,127 @@ export function createChatStreamRoute(deps: ChatStreamRouteDeps = {}) {
     let sawError = false;
     let lastUsage: { promptTokens: number; completionTokens: number } | undefined;
     try {
-      const messages = [
+      const messages: ChatMessage[] = [
         ...(body.systemPrompt
           ? [{ role: 'system' as const, content: body.systemPrompt }]
           : []),
         { role: 'user' as const, content: body.message },
       ];
+      const toolSchemas = toolRegistry.list().map(toOpenAiTool);
 
-      for await (const chunk of streamChat(provider, {
-        messages,
-        temperature: body.temperature,
-        max_tokens: body.maxTokens,
-        signal: abortCtl.signal,
-      })) {
-        if (closed) break;
-        if (chunk.delta) {
-          write(sseEncode({
-            type: 'text_delta',
-            messageId,
-            delta: chunk.delta,
-          }));
+      for (let turn = 0; turn <= MAX_TOOL_TURNS; turn += 1) {
+        const toolCalls = new Map<number, { index: number; id?: string; name?: string; arguments: string }>();
+        let assistantText = '';
+        for await (const chunk of streamChat(provider, {
+          messages,
+          temperature: body.temperature,
+          max_tokens: body.maxTokens,
+          tools: toolSchemas,
+          signal: abortCtl.signal,
+        })) {
+          if (closed) break;
+          if (chunk.delta) {
+            assistantText += chunk.delta;
+            write(sseEncode({
+              type: 'text_delta',
+              messageId,
+              delta: chunk.delta,
+            }));
+          }
+          for (const call of chunk.toolCalls ?? []) {
+            const current = toolCalls.get(call.index) ?? {
+              index: call.index,
+              arguments: '',
+            };
+            if (call.id) current.id = call.id;
+            if (call.name) current.name = call.name;
+            if (call.arguments) current.arguments += call.arguments;
+            toolCalls.set(call.index, current);
+          }
+          if (chunk.usage) {
+            lastUsage = chunk.usage;
+          }
+          if (chunk.finishReason) {
+            finishReason = chunk.finishReason;
+          }
+          if (chunk.done) break;
         }
-        if (chunk.usage) {
-          lastUsage = chunk.usage;
+        if (closed || toolCalls.size === 0) break;
+        if (turn === MAX_TOOL_TURNS) {
+          throw new Error('tool loop exceeded maximum turns');
         }
-        if (chunk.finishReason) {
-          finishReason = chunk.finishReason;
+
+        const validCalls = [...toolCalls.values()].filter(
+          (call): call is typeof call & { id: string; name: string } => Boolean(call.id && call.name),
+        );
+        messages.push({
+          role: 'assistant',
+          content: assistantText,
+          tool_calls: validCalls.map((call) => ({
+            id: call.id,
+            type: 'function' as const,
+            function: { name: call.name, arguments: call.arguments },
+          })),
+        });
+
+        for (const call of validCalls) {
+          const tool = toolRegistry.get(call.name);
+          const startedAt = Date.now();
+          const parsedArgs = parseToolArguments(call.arguments);
+          emitToolCall({
+            type: 'tool_call_start',
+            toolCallId: call.id,
+            name: call.name,
+            displayName: tool?.displayName ?? call.name,
+            displayDescription: tool?.displayDescription ?? '执行工具',
+            args: parsedArgs.value,
+            risk: tool?.risk,
+            timestamp: startedAt,
+          } satisfies ToolCallStartEvent);
+
+          let result: unknown;
+          let status: ToolCallResultEvent['status'] = 'success';
+          let errorMessage: string | undefined;
+          try {
+            if (!tool) throw new Error(`Unknown tool: ${call.name}`);
+            if (!parsedArgs.ok) {
+              throw new Error('工具参数不是有效 JSON');
+            }
+            const decision = deps.mainLoop
+              ? await deps.mainLoop.gateToolCall(tool, parsedArgs.value)
+              : tool.risk === 'high'
+                ? { kind: 'deny' as const, reason: 'high-risk tool requires explicit approval' }
+                : { kind: 'allow' as const };
+            if (decision.kind !== 'allow') throw new Error(decision.reason ?? 'Tool permission denied');
+            result = await tool.execute(parsedArgs.value);
+            if (
+              result && typeof result === 'object' && 'ok' in (result as Record<string, unknown>)
+              && (result as { ok?: unknown }).ok === false
+            ) {
+              status = 'error';
+              errorMessage = typeof (result as { error?: unknown }).error === 'string'
+                ? (result as { error: string }).error
+                : 'Tool returned a failure result';
+            }
+          } catch (err) {
+            status = 'error';
+            errorMessage = err instanceof Error ? err.message : String(err);
+            result = { ok: false, error: errorMessage };
+          }
+          emitToolCall({
+            type: 'tool_call_result',
+            toolCallId: call.id,
+            result,
+            durationMs: Date.now() - startedAt,
+            status,
+            errorMessage,
+          } satisfies ToolCallResultEvent);
+          messages.push({
+            role: 'tool',
+            content: JSON.stringify(result),
+            tool_call_id: call.id,
+          });
         }
-        if (chunk.done) break;
       }
     } catch (err) {
       sawError = true;
@@ -279,6 +391,7 @@ export function createChatStreamRoute(deps: ChatStreamRouteDeps = {}) {
       // ── 9. cleanup ─────────────────────────────────────────
       raw.off('close', onClose);
       unsubscribeToolCall();
+      unsubscribeAwareness();
       clearInterval(heartbeat);
       clearTimeout(streamTimeout);
       if (!closed) {
@@ -286,6 +399,35 @@ export function createChatStreamRoute(deps: ChatStreamRouteDeps = {}) {
       }
     }
   };
+}
+
+function toOpenAiTool(tool: ToolDefinition): Record<string, unknown> {
+  return {
+    type: 'function',
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters,
+    },
+  };
+}
+
+function parseToolArguments(raw: string): { value: Record<string, unknown>; ok: boolean } {
+  const trimmed = raw.trim();
+  if (!trimmed) return { value: {}, ok: false };
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return { value: parsed as Record<string, unknown>, ok: true };
+    }
+  } catch {
+    // fall through
+  }
+  return { value: {}, ok: false };
+}
+
+function parseOk(parsed: { value: Record<string, unknown>; ok: boolean }): boolean {
+  return parsed.ok;
 }
 
 // ── 错误友好化 (借鉴 chat-handler 的 toFriendlyMessage) ──────────

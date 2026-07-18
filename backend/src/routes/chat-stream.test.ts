@@ -257,6 +257,201 @@ describe('routes/chat-stream — SSE happy path', () => {
     expect(all).toContain('"status":"success"');
   });
 
+  it('executes an LLM tool call and feeds the result into the next model turn', async () => {
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const tool = {
+      name: 'read_file',
+      displayName: '读文件',
+      displayDescription: '读取文件内容',
+      description: 'Read a file',
+      parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+      risk: 'low' as const,
+      execute: vi.fn(async (args: Record<string, unknown>) => ({ ok: true, content: `内容:${String(args.path)}` })),
+    };
+    const responses = [
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"read_file","arguments":"{\\"path\\":\\"notes.md\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n' +
+        'data: [DONE]\n\n',
+      'data: {"choices":[{"delta":{"content":"已读取文件"},"finish_reason":"stop"}]}\n\n' +
+        'data: [DONE]\n\n',
+    ];
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      requestBodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+      const body = responses.shift();
+      return new Response(makeReadableStreamFromChunks([body ?? 'data: [DONE]\\n\\n']), {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      });
+    }));
+
+    const handler = createChatStreamRoute({
+      defaultProvider: 'ollama',
+      toolRegistry: {
+        list: () => [tool],
+        get: (name: string) => (name === tool.name ? tool : undefined),
+      } as any,
+      mainLoop: {
+        subscribeAwareness: () => () => undefined,
+        gateToolCall: vi.fn(async () => ({ kind: 'allow' })),
+      } as any,
+    });
+    const reply = makeFakeReply();
+    await handler({ body: { message: '读 notes.md', model: 'ollama' } } as any, reply.reply);
+    await reply.end();
+
+    const all = reply.chunks.join('');
+    expect(tool.execute).toHaveBeenCalledWith({ path: 'notes.md' });
+    expect(requestBodies).toHaveLength(2);
+    expect(requestBodies[0]?.tools).toBeDefined();
+    expect(requestBodies[1]?.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'tool', tool_call_id: 'call-1', content: JSON.stringify({ ok: true, content: '内容:notes.md' }) }),
+    ]));
+    expect(all).toContain('"type":"tool_call"');
+    expect(all).toContain('"type":"tool_call_start"');
+    expect(all).toContain('"type":"tool_call_result"');
+    expect(all).toContain('已读取文件');
+  });
+  it('forwards main-loop awareness events into the SSE chat stream', async () => {
+    let publishAwareness: ((env: unknown) => void) | undefined;
+    const tool = {
+      name: 'run_command',
+      displayName: '执行命令',
+      displayDescription: '执行项目命令',
+      description: 'Run a command',
+      parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] },
+      risk: 'high' as const,
+      execute: vi.fn(async () => ({ ok: true })),
+    };
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as { messages?: Array<{ role?: string }> };
+      if (body.messages?.some((message) => message.role === 'tool')) {
+        return new Response(makeReadableStreamFromChunks([
+          'data: {"choices":[{"delta":{"content":"完成"},"finish_reason":"stop"}]}\n\n' + 'data: [DONE]\n\n',
+        ]), { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+      }
+      return new Response(makeReadableStreamFromChunks([
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-perm","function":{"name":"run_command","arguments":"{\\"command\\":\\"npm test\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n' + 'data: [DONE]\n\n',
+      ]), { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    }));
+
+    const handler = createChatStreamRoute({
+      defaultProvider: 'ollama',
+      toolRegistry: { list: () => [tool], get: () => tool } as any,
+      mainLoop: {
+        subscribeAwareness: (handler: (env: unknown) => void) => {
+          publishAwareness = handler;
+          return () => { publishAwareness = undefined; };
+        },
+        gateToolCall: vi.fn(async () => {
+          publishAwareness?.({
+            id: 'perm-1',
+            type: 'awareness.update',
+            payload: { kind: 'permission.request', tool: 'run_command', reason: '需要确认' },
+          });
+          return { kind: 'deny', reason: 'Denied by user' };
+        }),
+      } as any,
+    });
+    const reply = makeFakeReply();
+    await handler({ body: { message: '运行测试', model: 'ollama' } } as any, reply.reply);
+    await reply.end();
+
+    expect(reply.chunks.join('')).toContain('"type":"awareness"');
+    expect(reply.chunks.join('')).toContain('permission.request');
+  });
+
+  it('marks a returned ok:false tool result as an error event', async () => {
+    const tool = {
+      name: 'read_file',
+      displayName: '读文件',
+      displayDescription: '读取文件内容',
+      description: 'Read a file',
+      parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+      risk: 'low' as const,
+      execute: vi.fn(async () => ({ ok: false, error: 'file not found' })),
+    };
+    const responses = [
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-fail","function":{"name":"read_file","arguments":"{\\"path\\":\\"missing.md\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n' + 'data: [DONE]\n\n',
+      'data: {"choices":[{"delta":{"content":"读取失败"},"finish_reason":"stop"}]}\n\n' + 'data: [DONE]\n\n',
+    ];
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      makeReadableStreamFromChunks([responses.shift() ?? 'data: [DONE]\\n\\n']),
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+    )));
+    const handler = createChatStreamRoute({
+      defaultProvider: 'ollama',
+      toolRegistry: { list: () => [tool], get: () => tool } as any,
+    });
+    const reply = makeFakeReply();
+    await handler({ body: { message: '读缺失文件', model: 'ollama' } } as any, reply.reply);
+
+    expect(reply.chunks.join('')).toContain('"status":"error"');
+    expect(reply.chunks.join('')).toContain('file not found');
+  });
+
+  it('does not execute a tool when streamed arguments are invalid JSON', async () => {
+    const tool = {
+      name: 'list_files',
+      displayName: '列文件',
+      displayDescription: '列出目录文件',
+      description: 'List files',
+      parameters: { type: 'object', properties: { path: { type: 'string' } } },
+      risk: 'low' as const,
+      execute: vi.fn(async () => ({ ok: true })),
+    };
+    const responses = [
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-bad-json","function":{"name":"list_files","arguments":"{bad"}}]},"finish_reason":"tool_calls"}]}\n\n' + 'data: [DONE]\n\n',
+      'data: {"choices":[{"delta":{"content":"参数错误"},"finish_reason":"stop"}]}\n\n' + 'data: [DONE]\n\n',
+    ];
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      makeReadableStreamFromChunks([responses.shift() ?? 'data: [DONE]\\n\\n']),
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+    )));
+    const handler = createChatStreamRoute({
+      defaultProvider: 'ollama',
+      toolRegistry: { list: () => [tool], get: () => tool } as any,
+    });
+    const reply = makeFakeReply();
+    await handler({ body: { message: '列文件', model: 'ollama' } } as any, reply.reply);
+
+    expect(tool.execute).not.toHaveBeenCalled();
+    expect(reply.chunks.join('')).toContain('"status":"error"');
+    expect(reply.chunks.join('')).toContain('工具参数不是有效 JSON');
+  });
+
+  it('does not execute a high-risk tool without explicit approval', async () => {
+    const tool = {
+      name: 'run_command',
+      displayName: '执行命令',
+      displayDescription: '执行项目命令',
+      description: 'Run a command',
+      parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] },
+      risk: 'high' as const,
+      execute: vi.fn(async () => ({ ok: true, stdout: 'should not run' })),
+    };
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+      const hasToolResult = Array.isArray(body.messages)
+        && (body.messages as Array<{ role?: string }>).some((message) => message.role === 'tool');
+      const response = hasToolResult
+        ? 'data: {"choices":[{"delta":{"content":"已拒绝"},"finish_reason":"stop"}]}\n\n' + 'data: [DONE]\n\n'
+        : 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-danger","function":{"name":"run_command","arguments":"{\\"command\\":\\"del important.txt\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n' + 'data: [DONE]\n\n';
+      return new Response(makeReadableStreamFromChunks([response]), {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      });
+    }));
+
+    const handler = createChatStreamRoute({
+      defaultProvider: 'ollama',
+      toolRegistry: { list: () => [tool], get: () => tool } as any,
+    });
+    const reply = makeFakeReply();
+    await handler({ body: { message: '删除重要文件', model: 'ollama' } } as any, reply.reply);
+    await reply.end();
+
+    expect(tool.execute).not.toHaveBeenCalled();
+    expect(reply.chunks.join('')).toContain('"type":"tool_call_result"');
+  });
   it('subscribers not invoked after unsubscribe + close', async () => {
     const seen: number[] = [];
     const unsub = subscribeToolCallEvents(() => seen.push(1));

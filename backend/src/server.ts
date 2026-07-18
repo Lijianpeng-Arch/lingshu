@@ -218,11 +218,32 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<BuiltApp> {
   // ── GET /api/health ──────────────────────────────────────────────
   app.get('/api/health', async () => ({ status: 'ok' }));
 
+  const PermissionResolveBodySchema = z.object({
+    decision: z.enum(['allow', 'deny']),
+  });
+  app.post<{ Params: { id: string }; Body: unknown }>(
+    '/api/permissions/:id/resolve',
+    async (req, reply) => {
+      const parsed = PermissionResolveBodySchema.safeParse(req.body);
+      if (!parsed.success) {
+        reply.code(400);
+        return { ok: false, error: parsed.error.message };
+      }
+      const resolved = mainLoop.resolvePermission(req.params.id, parsed.data.decision);
+      if (!resolved) {
+        reply.code(404);
+        return { ok: false, error: 'permission_not_found' };
+      }
+      return { ok: true };
+    },
+  );
+
   // ── POST /chat/stream (统一聊天通道, SSE 流式) ──────────────────
   // 灵枢前端唯一聊天入口。底层走 models/registry.streamChat(),
   // 已内建工具调用转发 / 用量记账 / 中断 / 心跳。ws /ws 通道并存供 agent 主循环用。
   const chatStreamHandler = createChatStreamRoute({
     mainLoop,
+    toolRegistry,
     defaultProvider: listAvailableProviders().includes('deepseek')
       ? 'deepseek'
       : listAvailableProviders()[0],

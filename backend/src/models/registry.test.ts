@@ -198,6 +198,73 @@ describe('models/registry — streamChat routing', () => {
     expect(headers['anthropic-version']).toBe('2023-06-01');
   });
 
+  it('parses tool calls and forwards tool definitions to OpenAI-compatible providers', async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const toolResponse = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(
+          'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"read_file","arguments":"{\\"path\\":\\"notes.md\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n' +
+          'data: [DONE]\n\n',
+        ));
+        controller.close();
+      },
+    });
+    const fetchMock = vi.fn().mockImplementation(async (_url: string, init: RequestInit) => {
+      bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+      return new Response(toolResponse, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const toolDefinition = {
+      type: 'function',
+      function: {
+        name: 'read_file',
+        description: 'Read a file',
+        parameters: { type: 'object', properties: { path: { type: 'string' } } },
+      },
+    };
+    const chunks = [] as Array<{ toolCalls?: Array<{ id?: string; name?: string; arguments?: string }>; finishReason?: string | null }>;
+    for await (const chunk of streamChat('deepseek', {
+      messages: [{ role: 'user', content: 'read notes' }],
+      tools: [toolDefinition],
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(bodies[0]?.tools).toEqual([toolDefinition]);
+    expect(chunks.some((chunk) => chunk.toolCalls?.[0]?.id === 'call-1')).toBe(true);
+    expect(chunks.at(-1)?.finishReason).toBe('tool_calls');
+  });
+
+  it('throws when an OpenAI-compatible SSE frame contains an error payload', async () => {
+    const fakeStream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(
+          'data: {"error":{"message":"rate limit reached"}}\n\n' +
+          'data: [DONE]\n\n',
+        ));
+        controller.close();
+      },
+    });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      new Response(fakeStream, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      }),
+    ));
+
+    await expect(async () => {
+      for await (const _ of streamChat('deepseek', {
+        messages: [{ role: 'user', content: 'hi' }],
+      })) {
+        // consume stream
+      }
+    }).rejects.toThrow('rate limit reached');
+  });
+
   it('throws when LLM returns non-2xx (OpenAI-compatible)', async () => {
     vi.stubGlobal(
       'fetch',

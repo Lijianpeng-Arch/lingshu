@@ -242,10 +242,10 @@ describe('createMainLoop — gateToolCall (Task 6)', () => {
     await expect(pending).resolves.toEqual({ kind: 'deny', reason: 'stopped' });
   });
 
-  it('ask → resolvePermission with unknown id: silently ignores (no crash)', async () => {
+  it('ask → resolvePermission with unknown id: returns false (no crash)', async () => {
     const { deps } = makeDeps();
     const loop = createMainLoop(deps);
-    expect(() => loop.resolvePermission('nonexistent', 'allow')).not.toThrow();
+    expect(loop.resolvePermission('nonexistent', 'allow')).toBe(false);
     loop.stop();
   });
 });

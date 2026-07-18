@@ -104,6 +104,8 @@ export interface MainLoop {
   /** Build an awareness update payload of the given kind */
   buildUpdate(kind: 'task' | 'thought' | 'status' | 'emotion', data: unknown): AwarenessUpdatePayload;
   getState(): MainLoopState;
+  /** Subscribe to awareness envelopes without replacing the existing renderer broadcast. */
+  subscribeAwareness(handler: (env: UACSEnvelope) => void): () => void;
   /**
    * Gate a tool call through the Permission system (Phase 6 / Task 6).
    *
@@ -120,11 +122,11 @@ export interface MainLoop {
     args: Record<string, unknown>,
   ): Promise<PermissionDecision>;
   /**
-   * Resolve a pending `permission.request` envelope. The envelope id was
-   * broadcast when the gate asked for permission. Silently no-ops if the
-   * id is unknown (e.g. already resolved or never registered).
+   * Resolve a pending `permission.request` envelope. Returns true when a
+   * resolver was found and called, false for unknown/already-resolved ids so
+   * the HTTP route can answer with 404 instead of pretending success.
    */
-  resolvePermission(envelopeId: string, decision: 'allow' | 'deny'): void;
+  resolvePermission(envelopeId: string, decision: 'allow' | 'deny'): boolean;
   /**
    * Goal mode entry (Phase 6 / Task 6).
    *
@@ -283,6 +285,7 @@ export function createMainLoop(deps: MainLoopDeps): MainLoop {
   const pendingPermissions = new Map<string, (decision: 'allow' | 'deny', reason?: string) => void>();
   // envId → timer handle so we can clearTimeout on resolve and on stop().
   const permissionTimers = new Map<string, NodeJS.Timeout>();
+  const awarenessSubscribers = new Set<(env: UACSEnvelope) => void>();
 
   function buildAwarenessSnapshot(): AwarenessSnapshotPayload {
     // Phase B.1: return schema-shaped empty data; Phase B.2 will query db.
@@ -413,6 +416,13 @@ export function createMainLoop(deps: MainLoopDeps): MainLoop {
       payload: event,
     } as unknown as UACSEnvelope;
     deps.broadcast(env);
+    for (const subscriber of awarenessSubscribers) {
+      try {
+        subscriber(env);
+      } catch (err) {
+        console.error('[main-loop] awareness subscriber failed:', err);
+      }
+    }
     // Spec 1 W3: 记录到反思 ring buffer
     recordEnvelope(env);
     return env;
@@ -487,10 +497,11 @@ export function createMainLoop(deps: MainLoopDeps): MainLoop {
     });
   }
 
-  function resolvePermission(envelopeId: string, decision: 'allow' | 'deny'): void {
+  function resolvePermission(envelopeId: string, decision: 'allow' | 'deny'): boolean {
     const resolver = pendingPermissions.get(envelopeId);
-    if (!resolver) return; // unknown / already-resolved — silently ignore
+    if (!resolver) return false; // unknown / already-resolved
     resolver(decision);
+    return true;
   }
 
   async function runGoalMode(
@@ -720,6 +731,7 @@ export function createMainLoop(deps: MainLoopDeps): MainLoop {
         resolver('deny', 'stopped');
       }
       pendingPermissions.clear();
+      awarenessSubscribers.clear();
     },
     triggerUserMessage() {
       void scheduler?.triggerImmediateTick('user_message');
@@ -737,6 +749,10 @@ export function createMainLoop(deps: MainLoopDeps): MainLoop {
             ? 'awakening'
             : 'idle';
       return { lastTickAt, tickCount, reason };
+    },
+    subscribeAwareness(handler) {
+      awarenessSubscribers.add(handler);
+      return () => awarenessSubscribers.delete(handler);
     },
     gateToolCall,
     resolvePermission,

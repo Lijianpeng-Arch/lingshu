@@ -16,12 +16,23 @@ export const CapabilitySchema = z.enum([
 ]);
 export type Capability = z.infer<typeof CapabilitySchema>;
 
+export const ChatToolCallSchema = z.object({
+  id: z.string().min(1),
+  type: z.literal('function'),
+  function: z.object({
+    name: z.string().min(1),
+    arguments: z.string(),
+  }),
+});
+export type ChatToolCall = z.infer<typeof ChatToolCallSchema>;
+
 // ── Chat message (OpenAI 兼容) ────────────────────────────────
 export const ChatMessageSchema = z.object({
   role: z.enum(['system', 'user', 'assistant', 'tool']),
   content: z.string(),
   name: z.string().optional(),
   tool_call_id: z.string().optional(),
+  tool_calls: z.array(ChatToolCallSchema).optional(),
 });
 export type ChatMessage = z.infer<typeof ChatMessageSchema>;
 

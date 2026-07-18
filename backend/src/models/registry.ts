@@ -105,14 +105,24 @@ export interface UnifiedChatRequest {
   max_tokens?: number;
   /** 流式 (default: true) */
   stream?: boolean;
+  /** OpenAI-compatible tool definitions. */
+  tools?: unknown[];
   /** 可选 abort signal */
   signal?: AbortSignal;
+}
+
+export interface UnifiedToolCall {
+  index: number;
+  id?: string;
+  name?: string;
+  arguments?: string;
 }
 
 // ── Streaming chunk 抽象 (V6 SSE 协议最简形态) ───────────────────
 export interface UnifiedChatChunk {
   delta: string;
   done: boolean;
+  toolCalls?: UnifiedToolCall[];
   /** Stop reason — 用各家的原文 (stop / end_turn / tool_use ...) */
   finishReason?: string | null;
   /**
@@ -144,10 +154,13 @@ async function* streamOpenAICompatible(
         role: m.role,
         content: m.content,
         name: m.name,
+        tool_call_id: m.tool_call_id,
+        tool_calls: m.tool_calls,
       })),
       temperature: req.temperature,
       max_tokens: req.max_tokens,
       stream: true,
+      ...(req.tools && req.tools.length > 0 ? { tools: req.tools } : {}),
     }),
     signal: req.signal,
   });
@@ -161,6 +174,8 @@ async function* streamOpenAICompatible(
   const decoder = new TextDecoder();
   let buffer = '';
   let lastUsage: UnifiedChatChunk['usage'];
+  let lastFinishReason: string | null = null;
+  let streamError: Error | undefined;
   try {
     while (true) {
       const { value, done } = await reader.read();
@@ -174,14 +189,33 @@ async function* streamOpenAICompatible(
         if (!trimmed || !trimmed.startsWith('data:')) continue;
         const payload = trimmed.slice(5).trim();
         if (payload === '[DONE]') {
-          yield { delta: '', done: true, finishReason: 'stop', usage: lastUsage };
+          yield { delta: '', done: true, finishReason: lastFinishReason ?? 'stop', usage: lastUsage };
           continue;
         }
         try {
           const parsed = JSON.parse(payload) as {
-            choices?: Array<{ delta?: { content?: string }; finish_reason?: string | null }>;
+            choices?: Array<{
+              delta?: {
+                content?: string;
+                tool_calls?: Array<{
+                  index?: number;
+                  id?: string;
+                  function?: { name?: string; arguments?: string };
+                }>;
+              };
+              finish_reason?: string | null;
+            }>;
             usage?: { prompt_tokens?: number; completion_tokens?: number };
+            error?: { message?: string; code?: string | number; type?: string };
           };
+          const errorPayload = parsed.error;
+          if (errorPayload?.message) {
+            const detail = errorPayload.code ? ` (code ${errorPayload.code})` : '';
+            streamError = new Error(
+              `${cfg.provider} stream error: ${errorPayload.message}${detail}`,
+            );
+            break;
+          }
           const choice = parsed.choices?.[0];
           // OpenAI 风格: usage 在最后一个 chunk (done=true 之前) 出现
           if (parsed.usage) {
@@ -192,9 +226,17 @@ async function* streamOpenAICompatible(
           }
           if (choice) {
             const delta = choice.delta?.content ?? '';
+            const toolCalls = choice.delta?.tool_calls?.map((call) => ({
+              index: call.index ?? 0,
+              id: call.id,
+              name: call.function?.name,
+              arguments: call.function?.arguments,
+            }));
+            if (choice.finish_reason) lastFinishReason = choice.finish_reason;
             yield {
               delta,
               done: false,
+              ...(toolCalls && toolCalls.length > 0 ? { toolCalls } : {}),
               finishReason: choice.finish_reason ?? null,
             };
           }
@@ -206,6 +248,7 @@ async function* streamOpenAICompatible(
   } finally {
     try { reader.releaseLock(); } catch { /* ignore */ }
   }
+  if (streamError) throw streamError;
 }
 
 // ── Anthropic Messages API (claude) ──────────────────────────────

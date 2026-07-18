@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { buildApp } from './server.js';
 
 describe('HTTP server', () => {
@@ -41,6 +41,19 @@ describe('HTTP server', () => {
       headers: { origin: 'http://localhost:5173' },
     });
     expect(response.headers['access-control-allow-origin']).toBe('http://localhost:5173');
+  });
+
+  it('returns 404 when resolving an unknown permission id', async () => {
+    const resolveSpy = vi.spyOn(built.mainLoop, 'resolvePermission');
+    const response = await built.app.inject({
+      method: 'POST',
+      url: '/api/permissions/perm-123/resolve',
+      payload: { decision: 'allow' },
+    });
+
+    expect(resolveSpy).toHaveBeenCalledWith('perm-123', 'allow');
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toEqual({ ok: false, error: 'permission_not_found' });
   });
 
   it('does not reflect an unknown CORS origin', async () => {
