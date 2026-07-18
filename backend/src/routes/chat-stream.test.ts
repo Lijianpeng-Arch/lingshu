@@ -361,6 +361,48 @@ describe('routes/chat-stream — SSE happy path', () => {
     expect(reply.chunks.join('')).toContain('permission.request');
   });
 
+  it('does not execute a tool after the SSE client closes', async () => {
+    const tool = {
+      name: 'read_file',
+      displayName: '读文件',
+      displayDescription: '读取文件内容',
+      description: 'Read a file',
+      parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+      risk: 'low' as const,
+      execute: vi.fn(async () => ({ ok: true })),
+    };
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      makeReadableStreamFromChunks(['data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-close","function":{"name":"read_file","arguments":"{\\"path\\":\\"notes.md\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n' + 'data: [DONE]\n\n']),
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+    )));
+    const handler = createChatStreamRoute({
+      defaultProvider: 'ollama',
+      toolRegistry: { list: () => [tool], get: () => tool } as any,
+      mainLoop: {
+        subscribeAwareness: () => () => undefined,
+        gateToolCall: vi.fn(async (_tool, _args, options) => {
+          // 等一微任务, 让 reply.close() 先把 abortCtl 触发
+          await new Promise((r) => setImmediate(r));
+          // 模拟 mainLoop 在 abort 触发时返回 deny; chat-stream 把它映射成 error
+          if (options?.signal?.aborted) throw new Error('stream closed');
+          return { kind: 'allow' };
+        }),
+      } as any,
+    });
+    const reply = makeFakeReply();
+    const promise = handler({ body: { message: '读文件', model: 'ollama' } } as any, reply.reply);
+    // 等到首次 chunk 到达, 模拟客户端断开
+    for (let i = 0; i < 50 && reply.chunks.length === 0; i += 1) {
+      await new Promise((r) => setImmediate(r));
+    }
+    reply.close();
+    await promise;
+    await reply.end();
+
+    expect(tool.execute).not.toHaveBeenCalled();
+    // 客户端断开时 SSE 不会再写任何 error 帧, 核心安全保证: 工具不执行
+  });
+
   it('does not forward tool_call events from other conversations', async () => {
     const tool = {
       name: 'read_file',

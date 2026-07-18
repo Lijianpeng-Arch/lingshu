@@ -111,7 +111,9 @@ export interface MainLoop {
    *
    * Returns the final decision (allow / deny). When the gate says "ask",
    * an AwarenessEvent `permission.request` is broadcast, and the call blocks
-   * until the user responds via `resolvePermission()` or the timeout fires.
+   * until the user responds via `resolvePermission()`, the timeout fires,
+   * or the optional `signal` aborts (treated as deny with reason
+   * "stream closed" so callers can surface a stop).
    *
    * `toolDef` supplies the risk metadata the gate needs. The actual tool.execute
    * is NOT called here — the caller (chat-handler) is responsible for invoking
@@ -120,6 +122,7 @@ export interface MainLoop {
   gateToolCall(
     toolDef: ToolDefinition,
     args: Record<string, unknown>,
+    options?: { signal?: AbortSignal },
   ): Promise<PermissionDecision>;
   /**
    * Resolve a pending `permission.request` envelope. Returns true when a
@@ -440,6 +443,7 @@ export function createMainLoop(deps: MainLoopDeps): MainLoop {
   async function gateToolCall(
     toolDef: ToolDefinition,
     args: Record<string, unknown>,
+    options?: { signal?: AbortSignal },
   ): Promise<PermissionDecision> {
     const settings = loadSettings();
     const decision = evaluate({
@@ -464,6 +468,30 @@ export function createMainLoop(deps: MainLoopDeps): MainLoop {
     const timeoutMs = (settings.permissionTimeoutSeconds ?? 60) * 1000;
 
     return new Promise<PermissionDecision>((resolve) => {
+      const cleanup = (): void => {
+        if (signal?.removeEventListener) {
+          signal.removeEventListener('abort', onAbort);
+        }
+      };
+      const onAbort = (): void => {
+        if (!pendingPermissions.has(env.id)) return;
+        const timer = permissionTimers.get(env.id);
+        if (timer) {
+          clearTimeout(timer);
+          permissionTimers.delete(env.id);
+        }
+        pendingPermissions.delete(env.id);
+        broadcastEvent({ kind: 'permission.resolved', decision: 'deny' });
+        resolve({ kind: 'deny', reason: 'stream closed' });
+        cleanup();
+      };
+      const signal = options?.signal;
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      signal?.addEventListener('abort', onAbort, { once: true });
+
       const resolver = (d: 'allow' | 'deny', reason?: string) => {
         const timer = permissionTimers.get(env.id);
         if (timer) {
@@ -471,6 +499,7 @@ export function createMainLoop(deps: MainLoopDeps): MainLoop {
           permissionTimers.delete(env.id);
         }
         pendingPermissions.delete(env.id);
+        cleanup();
         if (d === 'allow') {
           broadcastEvent({ kind: 'permission.resolved', decision: 'allow' });
           resolve({ kind: 'allow' });

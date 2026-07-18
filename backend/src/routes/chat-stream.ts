@@ -188,7 +188,6 @@ export function createChatStreamRoute(deps: ChatStreamRouteDeps = {}) {
     // ── 4. wire tool_call envelope → SSE forward ─────────────
     const conversationId = body.conversationId;
     const unsubscribeToolCall = subscribeToolCallEvents((event) => {
-      if (closed) return;
       if (conversationId && event.conversationId && event.conversationId !== conversationId) return;
       try {
         write(sseEncode({ type: 'tool_call', messageId, event }));
@@ -251,7 +250,6 @@ export function createChatStreamRoute(deps: ChatStreamRouteDeps = {}) {
           tools: toolSchemas,
           signal: abortCtl.signal,
         })) {
-          if (closed) break;
           if (chunk.delta) {
             assistantText += chunk.delta;
             write(sseEncode({
@@ -278,7 +276,13 @@ export function createChatStreamRoute(deps: ChatStreamRouteDeps = {}) {
           }
           if (chunk.done) break;
         }
-        if (closed || toolCalls.size === 0) break;
+        if (closed) {
+          throw new Error('stream closed');
+        }
+        if (toolCalls.size === 0) {
+          if (closed) throw new Error('stream closed');
+          break;
+        }
         if (turn === MAX_TOOL_TURNS) {
           throw new Error('tool loop exceeded maximum turns');
         }
@@ -321,11 +325,13 @@ export function createChatStreamRoute(deps: ChatStreamRouteDeps = {}) {
               throw new Error('工具参数不是有效 JSON');
             }
             const decision = deps.mainLoop
-              ? await deps.mainLoop.gateToolCall(tool, parsedArgs.value)
+              ? await deps.mainLoop.gateToolCall(tool, parsedArgs.value, { signal: abortCtl.signal })
               : tool.risk === 'high'
                 ? { kind: 'deny' as const, reason: 'high-risk tool requires explicit approval' }
                 : { kind: 'allow' as const };
+            if (closed) throw new Error('stream closed');
             if (decision.kind !== 'allow') throw new Error(decision.reason ?? 'Tool permission denied');
+            if (closed) throw new Error('stream closed');
             result = await tool.execute(parsedArgs.value);
             if (
               result && typeof result === 'object' && 'ok' in (result as Record<string, unknown>)
