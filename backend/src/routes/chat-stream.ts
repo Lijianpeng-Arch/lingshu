@@ -186,17 +186,30 @@ export function createChatStreamRoute(deps: ChatStreamRouteDeps = {}) {
     if (typeof streamTimeout.unref === 'function') streamTimeout.unref();
 
     // ── 4. wire tool_call envelope → SSE forward ─────────────
+    const conversationId = body.conversationId;
     const unsubscribeToolCall = subscribeToolCallEvents((event) => {
       if (closed) return;
+      if (conversationId && event.conversationId && event.conversationId !== conversationId) return;
       try {
         write(sseEncode({ type: 'tool_call', messageId, event }));
       } catch {
         // ignore write errors — client 已断
       }
     });
+    const conversationFilter = (envelope: unknown): boolean => {
+      if (!conversationId) return true;
+      if (!envelope || typeof envelope !== 'object') return true;
+      const payload = (envelope as { payload?: unknown }).payload;
+      if (!payload || typeof payload !== 'object') return true;
+      const envelopeConvId = (payload as { conversationId?: unknown }).conversationId;
+      if (typeof envelopeConvId !== 'string' || envelopeConvId.length === 0) return true;
+      return envelopeConvId === conversationId;
+    };
     const unsubscribeAwareness = deps.mainLoop
       ? deps.mainLoop.subscribeAwareness((envelope) => {
-          if (!closed) write(sseEncode({ type: 'awareness', messageId, envelope }));
+          if (closed) return;
+          if (!conversationFilter(envelope)) return;
+          write(sseEncode({ type: 'awareness', messageId, envelope }));
         })
       : () => undefined;
 
@@ -290,6 +303,7 @@ export function createChatStreamRoute(deps: ChatStreamRouteDeps = {}) {
           emitToolCall({
             type: 'tool_call_start',
             toolCallId: call.id,
+            conversationId,
             name: call.name,
             displayName: tool?.displayName ?? call.name,
             displayDescription: tool?.displayDescription ?? '执行工具',
@@ -330,6 +344,7 @@ export function createChatStreamRoute(deps: ChatStreamRouteDeps = {}) {
           emitToolCall({
             type: 'tool_call_result',
             toolCallId: call.id,
+            conversationId,
             result,
             durationMs: Date.now() - startedAt,
             status,

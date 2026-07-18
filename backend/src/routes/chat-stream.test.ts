@@ -342,6 +342,8 @@ describe('routes/chat-stream — SSE happy path', () => {
           return () => { publishAwareness = undefined; };
         },
         gateToolCall: vi.fn(async () => {
+          // 模拟真实 mainLoop.gateToolCall 内部: 等异步路径排上, 再 broadcast
+          await new Promise((r) => setImmediate(r));
           publishAwareness?.({
             id: 'perm-1',
             type: 'awareness.update',
@@ -357,6 +359,68 @@ describe('routes/chat-stream — SSE happy path', () => {
 
     expect(reply.chunks.join('')).toContain('"type":"awareness"');
     expect(reply.chunks.join('')).toContain('permission.request');
+  });
+
+  it('does not forward tool_call events from other conversations', async () => {
+    const tool = {
+      name: 'read_file',
+      displayName: '读文件',
+      displayDescription: '读取文件内容',
+      description: 'Read a file',
+      parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+      risk: 'low' as const,
+      execute: vi.fn(async () => ({ ok: true })),
+    };
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      makeReadableStreamFromChunks(['data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n' + 'data: [DONE]\n\n']),
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+    )));
+
+    const replyA = makeFakeReply();
+    const replyB = makeFakeReply();
+    let promiseA: Promise<void> | undefined;
+    let promiseB: Promise<void> | undefined;
+    const handler = createChatStreamRoute({
+      defaultProvider: 'ollama',
+      toolRegistry: { list: () => [tool], get: () => tool } as any,
+      mainLoop: { subscribeAwareness: () => () => undefined, gateToolCall: vi.fn(async () => ({ kind: 'allow' })) } as any,
+    });
+    promiseA = handler({ body: { message: 'A', model: 'ollama', conversationId: 'conv-A' } } as any, replyA.reply);
+    promiseB = handler({ body: { message: 'B', model: 'ollama', conversationId: 'conv-B' } } as any, replyB.reply);
+
+    // 等到 A 流出现 message_start 帧, 表明订阅已挂上 (handler 内 await 至少一次 microtask)
+    for (let i = 0; i < 100 && !replyA.chunks.join('').includes('message_start'); i += 1) {
+      await new Promise((r) => setImmediate(r));
+    }
+    emitToolCall({
+      type: 'tool_call_start',
+      toolCallId: 'tc-A',
+      conversationId: 'conv-A',
+      name: 'read_file',
+      displayName: '读文件',
+      displayDescription: '读取文件内容',
+      args: { path: 'notes.md' },
+      timestamp: Date.now(),
+    });
+    emitToolCall({
+      type: 'tool_call_start',
+      toolCallId: 'tc-B',
+      conversationId: 'conv-B',
+      name: 'read_file',
+      displayName: '读文件',
+      displayDescription: '读取文件内容',
+      args: { path: 'other.md' },
+      timestamp: Date.now(),
+    });
+
+    await Promise.all([promiseA!, promiseB!]);
+    await replyA.end();
+    await replyB.end();
+
+    expect(replyA.chunks.join('')).toContain('"toolCallId":"tc-A"');
+    expect(replyA.chunks.join('')).not.toContain('"toolCallId":"tc-B"');
+    expect(replyB.chunks.join('')).toContain('"toolCallId":"tc-B"');
+    expect(replyB.chunks.join('')).not.toContain('"toolCallId":"tc-A"');
   });
 
   it('marks a returned ok:false tool result as an error event', async () => {

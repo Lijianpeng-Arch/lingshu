@@ -10,6 +10,8 @@
  *   - 工具调用的全套 3 事件: start → args_delta → result
  *   - 不依赖外部 transport (HTTP / WS), 只通过 awareness 通道
  *   - 测试容易: 只需要 mock awarenessHandlers
+ *   - 跨聊天路由: 每个事件带 conversationId, 订阅者可按会话过滤
+ *     避免把 A 会话的工具卡片错投到 B 会话
  */
 
 // ── Tool Call Start ────────────────────────────────────────────────
@@ -18,6 +20,8 @@ export interface ToolCallStartEvent {
   type: 'tool_call_start';
   /** 工具调用唯一 ID (整个 start/args/result 链路共享) */
   toolCallId: string;
+  /** 触发本次工具的会话 ID (SSE 订阅者按它路由, 避免跨聊天串扰) */
+  conversationId?: string;
   /** 工具内部名 (e.g. 'read_file') */
   name: string;
   /** 工具中文展示名 (e.g. '读取文件') — ToolDefinition.displayName */
@@ -38,6 +42,8 @@ export interface ToolCallStartEvent {
 export interface ToolCallArgsDeltaEvent {
   type: 'tool_call_args_delta';
   toolCallId: string;
+  /** 触发本次工具的会话 ID */
+  conversationId?: string;
   /** JSON string 的 delta 片段 */
   argsDelta: string;
 }
@@ -47,6 +53,8 @@ export interface ToolCallArgsDeltaEvent {
 export interface ToolCallResultEvent {
   type: 'tool_call_result';
   toolCallId: string;
+  /** 触发本次工具的会话 ID */
+  conversationId?: string;
   /** 工具结果 (任意 JSON, 由 tool 自己决定 shape) */
   result: unknown;
   /** 耗时 (ms) */
