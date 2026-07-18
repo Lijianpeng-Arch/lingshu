@@ -64,6 +64,7 @@ import { createMcpRegistry } from './mcp/registry.js';
 import { createChatStreamRoute, createChatStreamMetaRoute } from './routes/chat-stream.js';
 import { listAvailableProviders } from './models/registry.js';
 import { createProvidersRoute } from './routes/providers.js';
+import { createSessionRepo } from './db/session-repo.js';
 
 /**
  * Boot-time Provider registration. Phase 2: env-driven. Phase 3: DB-backed.
@@ -116,6 +117,7 @@ export interface BuiltApp {
   app: FastifyInstance;
   mainLoop: MainLoop;
   clients: Set<WsClient>;
+  sessionRepo: ReturnType<typeof createSessionRepo>;
   /** Returns the host to bind to; throws if requested host is not in loopback whitelist. */
   resolveHost: (requested: string | undefined) => string;
   keepalive: NodeJS.Timeout;
@@ -139,6 +141,7 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<BuiltApp> {
   // the placeholder has* predicates with real pending-message / active-task state.
   const DB_PATH = opts.dbPath ?? process.env['LINGSHU_DB_PATH'] ?? path.join(os.homedir(), '.lingshu', 'data.sqlite');
   const sqlite = createSqlite(DB_PATH);
+  const sessionRepo = createSessionRepo(sqlite);
   const startedAtMs = Date.now();
   const clients = new Set<WsClient>();
 
@@ -216,6 +219,12 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<BuiltApp> {
   await app.register(websocket);
 
   // ── GET /api/health ──────────────────────────────────────────────
+  app.get<{ Params: { id: string } }>('/api/sessions/:id/messages', async (req) => {
+    return sessionRepo.getSessionMessages(req.params.id);
+  });
+
+  app.get('/api/sessions', async () => sessionRepo.listSessions(50));
+
   app.get('/api/health', async () => ({ status: 'ok' }));
 
   const PermissionResolveBodySchema = z.object({
@@ -244,6 +253,7 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<BuiltApp> {
   const chatStreamHandler = createChatStreamRoute({
     mainLoop,
     toolRegistry,
+    sessionRepo,
     defaultProvider: listAvailableProviders().includes('deepseek')
       ? 'deepseek'
       : listAvailableProviders()[0],
@@ -426,7 +436,7 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<BuiltApp> {
     mainLoop.start();
   }
 
-  return { app, mainLoop, clients, resolveHost, keepalive };
+  return { app, mainLoop, clients, sessionRepo, resolveHost, keepalive };
 }
 
 // ── Production entry-point ─────────────────────────────────────────────

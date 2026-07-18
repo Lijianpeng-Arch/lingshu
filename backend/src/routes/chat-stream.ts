@@ -93,6 +93,8 @@ export interface ChatStreamRouteDeps {
   defaultProvider?: ModelProvider;
   /** Tool registry used by the real LLM tool loop. */
   toolRegistry?: ToolRegistry;
+  /** Optional session repo — when provided, every chat round is persisted. */
+  sessionRepo?: import('../db/session-repo.js').SessionRepo;
 }
 
 export function createChatStreamRoute(deps: ChatStreamRouteDeps = {}) {
@@ -226,11 +228,28 @@ export function createChatStreamRoute(deps: ChatStreamRouteDeps = {}) {
       provider,
       body.model ?? provider
     );
+    if (deps.sessionRepo) {
+      const sid = body.conversationId ?? `conv-${Date.now()}`;
+      body.conversationId = sid;
+      deps.sessionRepo.ensureSession({
+        id: sid,
+        title: body.message.slice(0, 50),
+        provider,
+        model: body.model ?? provider,
+      });
+      deps.sessionRepo.recordMessage({
+        sessionId: sid,
+        role: 'user',
+        content: body.message,
+      });
+    }
 
     // ── 6. main: stream provider → text_delta ───────────────
     let finishReason: string | null = null;
     let sawError = false;
     let lastUsage: { promptTokens: number; completionTokens: number } | undefined;
+    let assistantText = '';
+    let totalToolCalls = 0;
     try {
       const messages: ChatMessage[] = [
         ...(body.systemPrompt
@@ -242,7 +261,6 @@ export function createChatStreamRoute(deps: ChatStreamRouteDeps = {}) {
 
       for (let turn = 0; turn <= MAX_TOOL_TURNS; turn += 1) {
         const toolCalls = new Map<number, { index: number; id?: string; name?: string; arguments: string }>();
-        let assistantText = '';
         for await (const chunk of streamChat(provider, {
           messages,
           temperature: body.temperature,
@@ -301,6 +319,7 @@ export function createChatStreamRoute(deps: ChatStreamRouteDeps = {}) {
         });
 
         for (const call of validCalls) {
+          totalToolCalls += 1;
           const tool = toolRegistry.get(call.name);
           const startedAt = Date.now();
           const parsedArgs = parseToolArguments(call.arguments);
@@ -407,6 +426,20 @@ export function createChatStreamRoute(deps: ChatStreamRouteDeps = {}) {
             finishReason,
             timestamp: Date.now(),
           }));
+        }
+        if (deps.sessionRepo) {
+          const sid = body.conversationId ?? `conv-${Date.now()}`;
+          deps.sessionRepo.recordMessage({
+            sessionId: sid,
+            role: 'assistant',
+            content: assistantText,
+            promptTokens: lastUsage?.promptTokens,
+            completionTokens: lastUsage?.completionTokens,
+          });
+          for (let i = 0; i < totalToolCalls; i += 1) {
+            deps.sessionRepo.incrementToolCall(sid);
+          }
+          deps.sessionRepo.finishSession(sid);
         }
       }
       // ── 9. cleanup ─────────────────────────────────────────

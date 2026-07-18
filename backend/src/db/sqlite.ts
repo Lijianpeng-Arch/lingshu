@@ -8,7 +8,7 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 const MIGRATIONS: Record<number, string[]> = {
   1: [
@@ -140,6 +140,32 @@ const MIGRATIONS: Record<number, string[]> = {
     // 借 LangGraph Send() (fan-out state) + Manus subagent_pool.py (sub-task pool)
     `ALTER TABLE plan_steps ADD COLUMN parallel_group TEXT`,
     `ALTER TABLE plan_steps ADD COLUMN subtasks TEXT`,
+  ],
+  6: [
+    // v0.3 — 会话持久化. 扩展 sessions 增加 token 计数 + 工具调用, 新增
+    // session_messages 存每轮 user/assistant 内容与工具卡片. 沿用现有
+    // sessions 表的 id 主键, 加上索引方便历史拉取.
+    `ALTER TABLE sessions ADD COLUMN started_at INTEGER`,
+    `ALTER TABLE sessions ADD COLUMN ended_at INTEGER`,
+    `ALTER TABLE sessions ADD COLUMN provider TEXT`,
+    `ALTER TABLE sessions ADD COLUMN model TEXT`,
+    `ALTER TABLE sessions ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE sessions ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE sessions ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE sessions ADD COLUMN tool_call_count INTEGER NOT NULL DEFAULT 0`,
+    `CREATE TABLE IF NOT EXISTS session_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'tool', 'system')),
+      content TEXT NOT NULL,
+      tool_call_id TEXT,
+      tool_name TEXT,
+      prompt_tokens INTEGER,
+      completion_tokens INTEGER,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_session_messages_session ON session_messages(session_id, created_at)`,
   ],
 };
 
