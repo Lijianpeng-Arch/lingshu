@@ -284,6 +284,7 @@ async function* streamClaude(
       max_tokens: req.max_tokens ?? 1024,
       temperature: req.temperature,
       stream: true,
+      ...(req.tools && req.tools.length > 0 ? { tools: req.tools } : {}),
     }),
     signal: req.signal,
   });
@@ -298,6 +299,8 @@ async function* streamClaude(
   let buffer = '';
   let finishReason: string | null = null;
   let lastUsage: UnifiedChatChunk['usage'];
+  // 累积 Anthropic tool_use 块; content_block_start 标记 id/name, delta 累积 input_json
+  const toolCalls: Map<number, { index: number; id?: string; name?: string; arguments: string }> = new Map();
   try {
     while (true) {
       const { value, done } = await reader.read();
@@ -313,11 +316,36 @@ async function* streamClaude(
         try {
           const parsed = JSON.parse(payload) as {
             type?: string;
-            delta?: { type?: string; text?: string };
+            index?: number;
+            delta?: { type?: string; text?: string; partial_json?: string };
+            content_block?: {
+              type?: string;
+              id?: string;
+              name?: string;
+              input?: unknown;
+            };
             message?: { stop_reason?: string; usage?: { input_tokens?: number; output_tokens?: number } };
             usage?: { input_tokens?: number; output_tokens?: number };
+            error?: { message?: string; code?: string | number; type?: string };
           };
-          if (parsed.type === 'content_block_delta' && parsed.delta?.type === 'text_delta') {
+          if (parsed.type === 'error' && parsed.error?.message) {
+            const detail = parsed.error.code ? ` (code ${parsed.error.code})` : '';
+            throw new Error(`claude stream error: ${parsed.error.message}${detail}`);
+          }
+          if (parsed.type === 'content_block_start' && parsed.content_block?.type === 'tool_use') {
+            const idx = parsed.index ?? toolCalls.size;
+            toolCalls.set(idx, {
+              index: idx,
+              id: parsed.content_block.id,
+              name: parsed.content_block.name,
+              arguments: '',
+            });
+          } else if (parsed.type === 'content_block_delta' && parsed.delta?.type === 'input_json_delta') {
+            const idx = parsed.index ?? 0;
+            const current = toolCalls.get(idx) ?? { index: idx, arguments: '' };
+            current.arguments += parsed.delta.partial_json ?? '';
+            toolCalls.set(idx, current);
+          } else if (parsed.type === 'content_block_delta' && parsed.delta?.type === 'text_delta') {
             yield {
               delta: parsed.delta.text ?? '',
               done: false,
@@ -333,11 +361,24 @@ async function* streamClaude(
               };
             }
           } else if (parsed.type === 'message_stop') {
-            yield { delta: '', done: true, finishReason, usage: lastUsage };
+            const toolCallsOut = [...toolCalls.values()].map((call, i) => ({
+              index: i,
+              id: call.id,
+              name: call.name,
+              arguments: call.arguments,
+            }));
+            yield {
+              delta: '',
+              done: true,
+              ...(toolCallsOut.length > 0 ? { toolCalls: toolCallsOut } : {}),
+              finishReason,
+              usage: lastUsage,
+            };
             return;
           }
-        } catch {
-          // skip malformed lines
+        } catch (err) {
+          // skip malformed lines; surface provider-level errors
+          if (err instanceof Error && err.message.startsWith('claude stream error')) throw err;
         }
       }
     }

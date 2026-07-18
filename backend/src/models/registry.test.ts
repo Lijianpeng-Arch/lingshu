@@ -126,6 +126,22 @@ describe('models/registry — streamChat routing', () => {
     }).rejects.toThrow(/Unknown model provider/);
   });
 
+  // push body via pull-based ReadableStream so the for-await consumer
+  // receives a real chunk before the controller closes (avoids the
+  // sync-start+close issue where reader.read returns done=true on first call).
+  function makeSseStream(body: string): ReadableStream<Uint8Array> {
+    return new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if ((controller as unknown as { _sent?: boolean })._sent) {
+          controller.close();
+          return;
+        }
+        (controller as unknown as { _sent: boolean })._sent = true;
+        controller.enqueue(new TextEncoder().encode(body));
+      },
+    });
+  }
+
   it('parses OpenAI-compatible SSE (deepseek, mocked fetch)', async () => {
     const fakeStream = new ReadableStream({
       start(controller) {
@@ -237,6 +253,53 @@ describe('models/registry — streamChat routing', () => {
     expect(bodies[0]?.tools).toEqual([toolDefinition]);
     expect(chunks.some((chunk) => chunk.toolCalls?.[0]?.id === 'call-1')).toBe(true);
     expect(chunks.at(-1)?.finishReason).toBe('tool_calls');
+  });
+
+  it('parses Anthropic tool_use content blocks and forwards tool definitions', async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const claudeBody =
+      'data: {"type":"message_start","message":{"id":"m1"}}\n\n' +
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}}\n\n' +
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":"}}\n\n' +
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\\"notes.md\\"}"}}\n\n' +
+      'data: {"type":"content_block_stop","index":0}\n\n' +
+      'data: {"type":"message_delta","delta":{},"message":{"stop_reason":"tool_use"}}\n\n' +
+      'data: {"type":"message_stop"}\n\n';
+    const fetchMock = vi.fn().mockImplementation(async (_url: string, init: RequestInit) => {
+      bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+      return new Response(makeSseStream(claudeBody), {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const toolDefinition = {
+      type: 'function',
+      function: {
+        name: 'read_file',
+        description: 'Read a file',
+        parameters: { type: 'object', properties: { path: { type: 'string' } } },
+      },
+    };
+    const chunks = [] as Array<{
+      toolCalls?: Array<{ index?: number; id?: string; name?: string; arguments?: string }>;
+      finishReason?: string | null;
+    }>;
+    for await (const chunk of streamChat('anthropic', {
+      messages: [{ role: 'user', content: 'read notes' }],
+      tools: [toolDefinition],
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(bodies[0]?.tools).toBeDefined();
+    expect(bodies[0]?.tools).toEqual([toolDefinition]);
+    const toolChunk = chunks.find((chunk) => chunk.toolCalls && chunk.toolCalls.length > 0);
+    expect(toolChunk?.toolCalls?.[0]?.id).toBe('toolu_1');
+    expect(toolChunk?.toolCalls?.[0]?.name).toBe('read_file');
+    expect(toolChunk?.toolCalls?.[0]?.arguments).toBe('{"path":"notes.md"}');
+    expect(chunks.at(-1)?.finishReason).toBe('tool_use');
   });
 
   it('throws when an OpenAI-compatible SSE frame contains an error payload', async () => {
